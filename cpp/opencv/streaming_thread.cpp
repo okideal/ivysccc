@@ -1,3 +1,9 @@
+//
+// Created by ivys on 19-7-8.
+//
+
+#include "../header/utils/streaming.h"
+
 VideoStream::VideoStream(GlobalConfig* global_cfg, int opt, const std::string &video_path, bool with_asyn) :
 global_cfg(global_cfg), opt(opt), with_asyn(with_asyn){
     if (opt == 0){
@@ -21,6 +27,7 @@ VideoStream::~VideoStream() {
         cap->release();
         delete(cap);
     }else{
+        asyn_cap->stop();
         asyn_cap->cap_->release();
         delete(asyn_cap);
     }
@@ -36,75 +43,77 @@ bool VideoStream::read(cv::Mat &output_img) {
 }
 
 VideoCaptureAsync::VideoCaptureAsync(const std::string &s_add): s_add(s_add){
-    re_init();
+    grab_on.store(false);
+    cap_ = std::make_shared<cv::VideoCapture>(cv::VideoCapture(s_add));
+    run();
 }
 
 VideoCaptureAsync::~VideoCaptureAsync() {
     cap_.reset();
 }
 
-void VideoCaptureAsync::re_init() {
-    capture_thread_running = false;
-    cap_.reset();
-    cap_ = boost::shared_ptr<cv::VideoCapture>(new cv::VideoCapture(s_add));
-    run();
-}
-
 void VideoCaptureAsync::run() {
-    boost::function0<void> f = boost::bind(&VideoCaptureAsync::do_capture, this);
-    boost::thread thrd(f);
+    //grab_t.detach();
+    grab_t = std::thread(&VideoCaptureAsync::do_capture, this);
+    grab_on.store(true);
 }
 
-bool VideoCaptureAsync::get_latest(cv::Mat &output) {
-    output.release();
-    std::lock_guard<std::mutex> lock(q_mutex);
-    cv::Mat o = framesQueue.front();
-    if(!o.empty()) {
-        o.copyTo(output);
-        while (!framesQueue.empty()) framesQueue.pop();
-        return true;
-    }else{
-        while (!framesQueue.empty()){
-            o = framesQueue.front();
-            if(!o.empty()) break;
-            else framesQueue.pop();
-        }
+void VideoCaptureAsync::stop() {
+    if(grab_on.load()){
+        grab_on.store(false);
+        grab_t.join();
 
-        while (!framesQueue.empty()) framesQueue.pop();
-        o.copyTo(output);
-        return !output.empty();
+        while (!framesQueue.empty()){
+            framesQueue.pop_front();
+        }
     }
 }
 
+bool VideoCaptureAsync::get_one_frame(cv::Mat &output, bool latest) {
+    std::lock_guard<std::mutex> lock(q_mutex);
+    if(framesQueue.empty()) return false;
+    if(latest) while (framesQueue.size()>1) framesQueue.pop_front();
+    framesQueue.front().copyTo(output);
+    framesQueue.pop_front();
+    return true;
+}
+
+bool VideoCaptureAsync::get_latest(cv::Mat &output) {
+    return get_one_frame(output, true);
+}
+
 void VideoCaptureAsync::do_capture() {
-    capture_thread_running = true;
-    while (capture_thread_running){
-        {
-            std::lock_guard<std::mutex> lock(s_mutex);
-        }
-
-        if(!cap_->isOpened()){
-            //todo log
-            std::cout << "Could not open camera, reinitializing!!" << std::endl;
-            re_init();
-            cv::waitKey(100);
-            continue;
-        }
-
-        if(!cap_->read(frame)){
-            //todo log
-            std::cout << "Could not capture frame, reinitializing!!" << std::endl;
-            re_init();
-        }
-
-        if(!frame.empty()){
-            std::lock_guard<std::mutex> g(q_mutex);
-            while (framesQueue.size() > max_queue_size){
-                framesQueue.pop();
+    try{
+        capture_thread_running = true;
+        while (capture_thread_running){
+            cv::Mat frame;
+            if(!cap_->isOpened()){
+                //todo log
+                cv::waitKey(100);
+                continue;
             }
-            framesQueue.push(frame.clone());
+
+            if(!cap_->read(frame)){
+                //todo log
+                usleep(1000);
+                continue;
+            }
+
+            if(!frame.empty()){
+                std::lock_guard<std::mutex> g(q_mutex);
+                framesQueue.push_back(frame.clone());
+                while (framesQueue.size() > max_queue_size){
+                    framesQueue.pop_front();
+                }
+            }
         }
+    }catch (cv::Exception &e){
+        std::cout << "caught cv::expection in do_capture" << std::endl;
+        std::cout << e.what() << std::endl;
+    }catch (...){
+        std::cout << "unknown exception caught in do_capture" << std::endl;
     }
     //todo log
     std::cout << "do capture stopped" << std::endl;
 }
+
